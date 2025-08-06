@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
+	"syscall"
 )
 
 func main() {
@@ -51,8 +53,20 @@ func parseFrameArgs(fset *flag.FlagSet, args []string) error {
 		return errors.New("source cannot be empty")
 	}
 
+	switch path.Ext(*source) {
+	case ".mp4":
+	default:
+		return errors.New("source file is not of a valid format")
+	}
+
 	if len(*destination) == 0 {
 		return errors.New("destination cannot be empty")
+	}
+
+	switch path.Ext(*destination) {
+	case ".jpg":
+	default:
+		return errors.New("destination file is not provided with a valid format")
 	}
 
 	return nil
@@ -70,18 +84,7 @@ func splitFrame(fset *flag.FlagSet) error {
 	}
 
 	spath := source.Value.String()
-	switch path.Ext(spath) {
-	case ".mp4":
-	default:
-		return errors.New("source file is not of a valid format")
-	}
-
 	dpath := destination.Value.String()
-	switch path.Ext(dpath) {
-	case ".jpg":
-	default:
-		return errors.New("destination file is not provided with a valid format")
-	}
 
 	fInfo, err := os.Stat(spath)
 	if err != nil {
@@ -187,81 +190,66 @@ func mergeVideos(fset *flag.FlagSet) error {
 	v2path := video2.Value.String()
 	dpath := destination.Value.String()
 
-	f1, err := os.Open(v1path)
+	v1raw, err := os.ReadFile(v1path)
 	if err != nil {
 		return err
 	}
-	defer f1.Close()
 
-	cmd1 := exec.Command(
-		"ffmpeg",
-		"-f", "mp4", "-i", "pipe:0",
-		"-f", "rawvideo", "-pix_fmt", "yuv420p",
-		"pipe:1",
-	)
-	var f1out, f1err bytes.Buffer
-	cmd1.Stdin = f1
-	cmd1.Stdout = &f1out
-	cmd1.Stderr = &f1err
-
-	if err := cmd1.Run(); err != nil {
-		return fmt.Errorf("error decoding %s: %s, f1err:%s", v1path, err, f1err.String())
-	}
-
-	fmt.Printf("f1out: %d\n", f1out.Len())
-
-	f2, err := os.Open(v2path)
+	v2raw, err := os.ReadFile(v2path)
 	if err != nil {
 		return err
 	}
-	defer f2.Close()
 
-	cmd2 := exec.Command(
-		"ffmpeg",
-		"-f", "mp4", "-i", "pipe:0",
-		"-f", "rawvideo", "-pix_fmt", "yuv420p",
-		"pipe:1",
-	)
-	var f2out, f2err bytes.Buffer
-	cmd2.Stdin = f2
-	cmd2.Stdout = &f2out
-	cmd2.Stderr = &f2err
-
-	if err := cmd2.Run(); err != nil {
-		return fmt.Errorf("error decoding %s: %s, f2err:%s", v2path, err, f2err.String())
+	pipe1 := "1" + filepath.Base(v1path)
+	if err := syscall.Mkfifo(pipe1, 0600); err != nil {
+		return err
 	}
 
-	fmt.Printf("f2out: %d\n", f2out.Len())
+	pipe2 := "2" + filepath.Base(v2path)
+	if err := syscall.Mkfifo(pipe2, 0600); err != nil {
+		return err
+	}
 
-	var merged bytes.Buffer
-	merged.Write(f1out.Bytes())
-	//merged.Write(f2out.Bytes())
+	go func() {
+		f, _ := os.OpenFile(pipe1, os.O_WRONLY, os.ModeNamedPipe)
+		defer f.Close()
+		f.Write(v1raw)
+	}()
 
-	cmd3 := exec.Command(
+	go func() {
+		f, _ := os.OpenFile(pipe2, os.O_WRONLY, os.ModeNamedPipe)
+		defer f.Close()
+		f.Write(v2raw)
+	}()
+
+	cmd := exec.Command(
 		"ffmpeg",
-		"-f", "rawvideo",
-		"-pix_fmt", "yuv420p",
-		"-s", "1920x1080",
-		"-r", "30",
-		"-i", "pipe:0",
-		"-c:v", "libx264",
-		"-preset", "medium",
-		"-crf", "23",
+		"-i", pipe1,
+		"-i", pipe2,
+		"-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[outv]",
+		"-map", "[outv]",
 		"-f", "mp4",
 		"-movflags", "frag_keyframe+empty_moov",
 		"pipe:1",
 	)
 	var f3out, f3err bytes.Buffer
-	cmd3.Stdin = &merged
-	cmd3.Stdout = &f3out
-	cmd3.Stderr = &f3err
+	cmd.Stdout = &f3out
+	cmd.Stderr = &f3err
 
-	if err := cmd3.Run(); err != nil {
+	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("error encoding merged stream. err:%s, f3err:%s", err, f3err.String())
 	}
 
 	if err := os.WriteFile(dpath, f3out.Bytes(), 0644); err != nil {
 		return err
+	}
+
+	if err := os.Remove(pipe1); err != nil {
+		fmt.Printf("remove pipe1: %s", err)
+	}
+
+	if err := os.Remove(pipe2); err != nil {
+		fmt.Printf("remove pipe2: %s", err)
 	}
 
 	return nil
